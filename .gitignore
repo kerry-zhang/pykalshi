@@ -34,6 +34,9 @@ data/
 trades.csv
 sync_trades.log
 
+# Strategy research (private)
+strategy/
+
 # Temp
 .pytest_cache/
 .coverage
