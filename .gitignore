@@ -32,6 +32,7 @@ data/
 
 # Trade log
 trades.csv
+sync_trades.log
 
 # Temp
 .pytest_cache/
