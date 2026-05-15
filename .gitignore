@@ -30,6 +30,9 @@ build/
 data/
 
 
+# Trade log
+trades.csv
+
 # Temp
 .pytest_cache/
 .coverage

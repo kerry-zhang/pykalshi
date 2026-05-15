@@ -1,0 +1,168 @@
+"""Trade logger: tracks systematic vs discretionary Kalshi fills."""
+
+import csv
+import os
+import time
+from datetime import datetime, timezone
+
+from pykalshi import KalshiClient
+from pykalshi.enums import Action, Side, TimeInForce, SelfTradePrevention
+
+LOG_FILE = os.path.join(os.path.dirname(__file__), "trades.csv")
+
+_COLUMNS = [
+    "fill_id", "trade_id", "order_id", "ticker",
+    "side", "action", "contracts", "yes_price",
+    "fee", "type", "strategy", "logged_at",
+]
+
+
+# --- Internal helpers ---
+
+def _load_logged_ids() -> set:
+    if not os.path.exists(LOG_FILE):
+        return set()
+    with open(LOG_FILE, newline="") as f:
+        return {row["fill_id"] for row in csv.DictReader(f)}
+
+
+def _append_rows(rows: list) -> None:
+    write_header = not os.path.exists(LOG_FILE)
+    with open(LOG_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _fill_to_row(fill, trade_type: str, strategy: str | None) -> dict:
+    return {
+        "fill_id": fill.fill_id or fill.trade_id,
+        "trade_id": fill.trade_id,
+        "order_id": fill.order_id,
+        "ticker": fill.ticker,
+        "side": fill.side.value if hasattr(fill.side, "value") else fill.side,
+        "action": fill.action.value if hasattr(fill.action, "value") else fill.action,
+        "contracts": fill.count_fp,
+        "yes_price": fill.yes_price_dollars,
+        "fee": fill.fee_cost_dollars or "0",
+        "type": trade_type,
+        "strategy": strategy or "",
+        "logged_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _log_fills(fills, trade_type: str, strategy: str | None) -> int:
+    logged = _load_logged_ids()
+    new_rows = [
+        _fill_to_row(f, trade_type, strategy)
+        for f in fills
+        if (f.fill_id or f.trade_id) not in logged
+    ]
+    if new_rows:
+        _append_rows(new_rows)
+    return len(new_rows)
+
+
+# --- Public API ---
+
+def place_systematic_order(
+    client: KalshiClient,
+    ticker: str,
+    action: Action,
+    side: Side,
+    count_fp: str,
+    *,
+    yes_price_dollars: str | None = None,
+    no_price_dollars: str | None = None,
+    strategy: str | None = None,
+    **kwargs,
+):
+    """Place an order and automatically log its fills as systematic.
+
+    All extra keyword args are forwarded to portfolio.place_order().
+    Returns the Order object.
+    """
+    order = client.portfolio.place_order(
+        ticker, action, side, count_fp,
+        yes_price_dollars=yes_price_dollars,
+        no_price_dollars=no_price_dollars,
+        **kwargs,
+    )
+    # Brief pause so fills appear in the API before fetching
+    time.sleep(0.5)
+    fills = client.portfolio.get_fills(order_id=order.order_id)
+    logged = _log_fills(fills, "systematic", strategy)
+    print(f"Order placed ({order.order_id}): logged {logged} fill(s) as systematic"
+          + (f" [{strategy}]" if strategy else ""))
+    return order
+
+
+def sync_discretionary(client: KalshiClient, limit: int = 200) -> int:
+    """Fetch recent fills and log any not already tracked as discretionary.
+
+    Call this periodically to capture trades placed via the Kalshi app.
+    Returns the number of new discretionary fills logged.
+    """
+    fills = client.portfolio.get_fills(limit=limit)
+    logged = _log_fills(fills, "discretionary", None)
+    if logged:
+        print(f"Synced {logged} new discretionary fill(s).")
+    else:
+        print("No new discretionary fills found.")
+    return logged
+
+
+def summary() -> None:
+    """Print a breakdown of logged trades by type (systematic vs discretionary)."""
+    if not os.path.exists(LOG_FILE):
+        print("No trades logged yet.")
+        return
+
+    from collections import defaultdict
+
+    stats = defaultdict(lambda: {
+        "fills": 0, "tickers": set(),
+        "buy_contracts": 0.0, "buy_cost": 0.0,
+        "sell_contracts": 0.0, "sell_proceeds": 0.0,
+    })
+    strategies = defaultdict(set)
+
+    with open(LOG_FILE, newline="") as f:
+        for row in csv.DictReader(f):
+            t = row["type"]
+            s = stats[t]
+            s["fills"] += 1
+            s["tickers"].add(row["ticker"])
+            contracts = float(row["contracts"])
+            price = float(row["yes_price"])
+            cost = contracts * price
+            if row["action"] == "buy":
+                s["buy_contracts"] += contracts
+                s["buy_cost"] += cost
+            else:
+                s["sell_contracts"] += contracts
+                s["sell_proceeds"] += cost
+            if row.get("strategy"):
+                strategies[t].add(row["strategy"])
+
+    print(f"\n{'='*45}")
+    print(f"{'TRADE LOG SUMMARY':^45}")
+    print(f"{'='*45}")
+
+    for trade_type in ["systematic", "discretionary"]:
+        if trade_type not in stats:
+            continue
+        s = stats[trade_type]
+        net = s["buy_cost"] - s["sell_proceeds"]
+        realized = s["sell_proceeds"] - s["buy_cost"] if s["sell_contracts"] > 0 else 0.0
+        print(f"\n  [{trade_type.upper()}]")
+        print(f"  Fills:             {s['fills']}")
+        print(f"  Unique tickers:    {len(s['tickers'])}")
+        print(f"  Bought:            {s['buy_contracts']:.0f} contracts  (${s['buy_cost']:.2f})")
+        print(f"  Sold:              {s['sell_contracts']:.0f} contracts  (${s['sell_proceeds']:.2f})")
+        print(f"  Net deployed:      ${net:.2f}")
+        if strategies[trade_type]:
+            print(f"  Strategies:        {', '.join(sorted(strategies[trade_type]))}")
+
+    print()
