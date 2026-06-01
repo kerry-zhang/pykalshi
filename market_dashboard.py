@@ -19,7 +19,10 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, LineChart, Reference
 
+from urllib.parse import urlencode
+
 from pykalshi import KalshiClient, MarketStatus
+from pykalshi.models import MarketModel as _MarketModel
 
 TRADES_CSV = os.path.join(os.path.dirname(__file__), "trades.csv")
 
@@ -32,34 +35,83 @@ MIN_VOLUME    = 1.0       # drop truly zero-volume markets
 # Data collection
 # ---------------------------------------------------------------------------
 
-def build_series_category_map(client) -> dict:
-    """Return a lazy-populating cache: look up series only as needed."""
-    # Seed with common ones so most markets need no API call
-    seed = {
-        "KXNBA": "Sports", "KXNFL": "Sports", "KXMLB": "Sports",
-        "KXNHL": "Sports", "KXNHLOVERTIME": "Sports", "KXMMA": "Sports",
-        "KXNASCAR": "Sports", "KXPGA": "Sports", "KXTENNIS": "Sports",
-        "KXBTC": "Crypto", "KXETH": "Crypto", "KXXRPD": "Crypto",
-        "KXSOLD": "Crypto", "KXAVAXD": "Crypto", "KXSUID": "Crypto",
-        "KXCPI": "Economics", "KXFOMC": "Economics", "KXPCE": "Economics",
-        "KXJOBS": "Economics", "KXGDP": "Economics", "KXUNRATE": "Economics",
-        "KXSPX": "Financials", "KXNASDAQ": "Financials", "KXDOW": "Financials",
-        "KXPOTUS": "Politics", "KXSENATE": "Politics", "KXHOUSE": "Politics",
-        "KXOSCARS": "Entertainment", "KXEMMYS": "Entertainment",
-    }
+_SERIES_SEED = {
+    # Tennis
+    "KXATPMATCH": "Sports", "KXATPCHALLENGERMATCH": "Sports",
+    "KXITFMATCH": "Sports", "KXITFWMATCH": "Sports", "KXWTAMATCH": "Sports",
+    # US major leagues
+    "KXNBA": "Sports", "KXNFL": "Sports", "KXMLB": "Sports", "KXMLBGAME": "Sports",
+    "KXNHL": "Sports", "KXNHLOVERTIME": "Sports", "KXMMA": "Sports",
+    "KXNASCAR": "Sports", "KXPGA": "Sports", "KXTENNIS": "Sports",
+    # Soccer / international
+    "KXMLS": "Sports", "KXJLEAGUE": "Sports", "KXJLEAGUEGAME": "Sports",
+    "KXBUNDESLIGA": "Sports", "KXLALIGA": "Sports", "KXPREMIERLEAGUE": "Sports",
+    "KXLIGUE1": "Sports", "KXSERIEA": "Sports", "KXEREDIVIS": "Sports",
+    "KXCHAMPIONSLEAGUE": "Sports", "KXEUROPALEAGUE": "Sports",
+    "KXAFCON": "Sports", "KXWORLDCUP": "Sports", "KXCOPALIBERTADORES": "Sports",
+    "KXCRICKET": "Sports", "KXCRICKETTESTMATCH": "Sports",
+    "KXBOXING": "Sports", "KXRUGBY": "Sports", "KXGOLF": "Sports",
+    # Esports
+    "KXCS2": "Esports", "KXCS2GAME": "Esports",
+    "KXLOL": "Esports", "KXDOTA2": "Esports", "KXVALORANT": "Esports",
+    "KXOVERWATCH": "Esports", "KXROCKETLEAGUE": "Esports",
+    # Crypto
+    "KXBTC": "Crypto", "KXBTC15M": "Crypto",
+    "KXETH": "Crypto", "KXXRPD": "Crypto",
+    "KXSOLD": "Crypto", "KXAVAXD": "Crypto", "KXSUID": "Crypto",
+    "KXHYPE15M": "Crypto",
+    # Economics / macro
+    "KXCPI": "Economics", "KXFOMC": "Economics", "KXPCE": "Economics",
+    "KXJOBS": "Economics", "KXGDP": "Economics", "KXUNRATE": "Economics",
+    "KXWAGESAT": "Economics", "KXGOVIANOMR": "Economics",
+    # Financials
+    "KXSPX": "Financials", "KXNASDAQ": "Financials", "KXDOW": "Financials",
+    # Politics / elections
+    "KXPOTUS": "Politics", "KXSENATE": "Politics", "KXHOUSE": "Politics",
+    # Mentions (word/phrase markets — all grouped together)
+    "KXTRUMPSAY": "Mentions", "KXTRUMPMENTION": "Mentions",
+    "KXTRUMPMENTIONB": "Mentions", "KXVANCEMENTION": "Mentions",
+    "KXHEARINGMENTION": "Mentions", "KXMRBEASTMENTION": "Mentions",
+    "KXEARNINGSMENTION": "Mentions", "KXEARNINGSMENTIONTGT": "Mentions",
+    # Entertainment / culture
+    "KXOSCARS": "Entertainment", "KXEMMYS": "Entertainment",
+    "KXGRAMMYS": "Entertainment", "KXDUBLINBY": "Entertainment",
+    # IPO
+    "KXIPOANTHROPIC": "IPO", "KXIPOOPENAI": "IPO",
+}
 
-    class LazyMap(dict):
+# Keyword fallbacks for series not in the seed — checked in order
+_KEYWORD_RULES: list[tuple[list[str], str]] = [
+    (["ATP", "ITF", "WTA", "MATCH", "GAME", "NBA", "NFL", "MLB", "NHL",
+      "SOCCER", "FOOTBALL", "CRICKET", "RUGBY", "MLS", "LEAGUE", "CUP",
+      "CHAMPION", "TENNIS", "BOXING", "MMA", "NASCAR", "PGA", "GOLF"],  "Sports"),
+    (["CS2", "LOL", "DOTA", "VALORANT", "OVERWATCH", "ESPORT", "ROCKET"], "Esports"),
+    (["BTC", "ETH", "SOL", "XRP", "AVAX", "CRYPTO", "COIN", "HYPE"],     "Crypto"),
+    (["CPI", "FOMC", "PCE", "GDP", "UNRATE", "JOBS", "WAGE", "FED"],      "Economics"),
+    (["SPX", "NASDAQ", "DOW", "STOCK", "EQUITY"],                          "Financials"),
+    (["MENTION", "SAY", "TRUMP", "VANCE", "HEARING", "MRBEAST", "EARNINGS"], "Mentions"),
+    (["POTUS", "SENATE", "HOUSE", "ELECTION", "VOTE"],                    "Politics"),
+]
+
+
+def _guess_category(series: str) -> str:
+    s = series.upper()
+    for keywords, category in _KEYWORD_RULES:
+        if any(k in s for k in keywords):
+            return category
+    return "Other"
+
+
+def build_series_category_map() -> dict:
+    """Return a map from series ticker → category using seed + keyword heuristics (no API calls)."""
+    class HeuristicMap(dict):
         def __missing__(self, key):
-            try:
-                s = client.get_series(key)
-                val = s.category or "Unknown"
-            except Exception:
-                val = "Unknown"
+            val = _guess_category(key)
             self[key] = val
             return val
 
-    m = LazyMap(seed)
-    print(f"Series map initialised ({len(seed)} pre-seeded, rest looked up on demand).")
+    m = HeuristicMap(_SERIES_SEED)
+    print(f"Series map initialised ({len(_SERIES_SEED)} seeded, unknown series use keyword heuristics).")
     return m
 
 
@@ -69,45 +121,48 @@ def infer_series(ticker: str) -> str:
 
 
 def pull_settled(client, series_map: dict, pages: int = SETTLED_PAGES) -> list[dict]:
-    """Pull settled markets across multiple pages and return as list of dicts."""
-    print(f"Fetching settled markets ({pages} pages x 200)...")
+    """Pull settled non-MVE markets via raw HTTP so the cursor advances correctly."""
+    print(f"Fetching settled markets (up to {pages} pages x 200, MVE excluded)...")
     rows = []
     cursor = None
 
     for page in range(pages):
-        kwargs = {"status": MarketStatus.SETTLED, "limit": 200}
+        params: dict = {"status": "settled", "limit": 200, "mve_filter": "exclude"}
         if cursor:
-            kwargs["cursor"] = cursor
+            params["cursor"] = cursor
+        qs = urlencode({k: v for k, v in params.items() if v is not None})
+        response = client.get(f"/markets?{qs}")
 
-        batch = client.get_markets(**kwargs)
-        if not batch:
-            break
+        markets_data = response.get("markets") or []
+        cursor = response.get("cursor") or ""
 
-        for m in batch:
+        for m_data in markets_data:
+            try:
+                m = _MarketModel.model_validate(m_data)
+            except Exception:
+                continue
             vol = float(m.volume_fp or 0)
             if vol < MIN_VOLUME:
                 continue
-            if m.ticker.startswith("KXMVE"):
-                continue
 
             series = m.series_ticker or infer_series(m.ticker)
-            category = series_map.get(series, "Unknown")
+            category = series_map.get(series, _guess_category(series))
             close_dt = _parse_dt(m.close_time)
 
             rows.append({
-                "ticker":   m.ticker,
-                "series":   series,
-                "category": category,
-                "volume":   vol,
-                "result":   (m.result or "").lower(),
+                "ticker":      m.ticker,
+                "series":      series,
+                "category":    category,
+                "volume":      vol,
+                "result":      (m.result or "").lower(),
                 "close_month": close_dt.strftime("%Y-%m") if close_dt else "Unknown",
                 "close_date":  close_dt.date() if close_dt else None,
             })
 
-        print(f"  Page {page + 1}/{pages}: {len(batch)} markets, {len(rows)} kept so far")
+        print(f"  Page {page + 1}/{pages}: {len(markets_data)} markets, {len(rows)} kept so far")
 
-        if len(batch) < 200:
-            break  # last page
+        if not cursor or len(markets_data) < 200:
+            break
 
     print(f"  Total settled markets with volume: {len(rows)}")
     return rows
@@ -132,7 +187,7 @@ def pull_open_24h(client, series_map: dict) -> list[dict]:
                 if vol_24h < MIN_VOLUME:
                     continue
                 series = m.series_ticker or infer_series(m.ticker)
-                category = series_map.get(series, "Unknown")
+                category = series_map[series]  # triggers heuristic fallback via __missing__
                 rows.append({
                     "ticker":     m.ticker,
                     "series":     series,
@@ -214,16 +269,8 @@ def active_now(open_rows: list[dict]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _infer_category(ticker: str) -> str:
-    t = ticker.upper()
-    if any(x in t for x in ["ATP", "ITF", "WTA", "CRICKET", "NBA", "NFL", "MLB", "NHL", "TENNIS", "SOCCER"]):
-        return "Sports"
-    if any(x in t for x in ["TRUMP", "VANCE", "HEARING", "POTUS"]):
-        return "Politics"
-    if any(x in t for x in ["EARNINGS", "CPI", "FOMC", "PCE", "GDP"]):
-        return "Economics"
-    if any(x in t for x in ["MRBEAST", "MUSIC", "STREAM"]):
-        return "Entertainment"
-    return "Other"
+    """Infer category from ticker when trades.csv has no category set."""
+    return _guess_category(infer_series(ticker))
 
 
 def build_trade_pnl(client) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -704,8 +751,8 @@ def export_excel(cat_df, time_df, active_df, settled_df=None, open_df=None, anal
 # ---------------------------------------------------------------------------
 
 def main():
+    series_map = build_series_category_map()
     with KalshiClient.from_env() as client:
-        series_map   = build_series_category_map(client)
         settled_rows = pull_settled(client, series_map)
         open_rows    = pull_open_24h(client, series_map)
         settled_pnl, open_positions = build_trade_pnl(client)
