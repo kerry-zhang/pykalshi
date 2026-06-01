@@ -13,7 +13,7 @@ LOG_FILE = os.path.join(os.path.dirname(__file__), "trades.csv")
 _COLUMNS = [
     "fill_id", "trade_id", "order_id", "ticker",
     "side", "action", "contracts", "yes_price",
-    "fee", "type", "strategy", "logged_at",
+    "fee", "type", "strategy", "category", "bet", "logged_at",
 ]
 
 
@@ -35,7 +35,12 @@ def _append_rows(rows: list) -> None:
         writer.writerows(rows)
 
 
-def _fill_to_row(fill, trade_type: str, strategy: str | None) -> dict:
+def _fill_to_row(fill, trade_type: str, strategy: str | None, market=None) -> dict:
+    category = ""
+    bet = ""
+    if market is not None:
+        category = getattr(market, "category", "") or ""
+        bet = getattr(market, "title", "") or ""
     return {
         "fill_id": fill.fill_id or fill.trade_id,
         "trade_id": fill.trade_id,
@@ -48,14 +53,16 @@ def _fill_to_row(fill, trade_type: str, strategy: str | None) -> dict:
         "fee": fill.fee_cost_dollars or "0",
         "type": trade_type,
         "strategy": strategy or "",
+        "category": category,
+        "bet": bet,
         "logged_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def _log_fills(fills, trade_type: str, strategy: str | None) -> int:
+def _log_fills(fills, trade_type: str, strategy: str | None, markets: dict = None) -> int:
     logged = _load_logged_ids()
     new_rows = [
-        _fill_to_row(f, trade_type, strategy)
+        _fill_to_row(f, trade_type, strategy, (markets or {}).get(f.ticker))
         for f in fills
         if (f.fill_id or f.trade_id) not in logged
     ]
@@ -83,6 +90,7 @@ def place_systematic_order(
     All extra keyword args are forwarded to portfolio.place_order().
     Returns the Order object.
     """
+    market = client.get_market(ticker if isinstance(ticker, str) else ticker.ticker)
     order = client.portfolio.place_order(
         ticker, action, side, count_fp,
         yes_price_dollars=yes_price_dollars,
@@ -92,7 +100,7 @@ def place_systematic_order(
     # Brief pause so fills appear in the API before fetching
     time.sleep(0.5)
     fills = client.portfolio.get_fills(order_id=order.order_id)
-    logged = _log_fills(fills, "systematic", strategy)
+    logged = _log_fills(fills, "systematic", strategy, {market.ticker: market})
     print(f"Order placed ({order.order_id}): logged {logged} fill(s) as systematic"
           + (f" [{strategy}]" if strategy else ""))
     return order
@@ -105,7 +113,17 @@ def sync_discretionary(client: KalshiClient, limit: int = 200) -> int:
     Returns the number of new discretionary fills logged.
     """
     fills = client.portfolio.get_fills(limit=limit)
-    logged = _log_fills(fills, "discretionary", None)
+    # Fetch market metadata for any tickers not yet logged
+    logged_ids = _load_logged_ids()
+    new_fills = [f for f in fills if (f.fill_id or f.trade_id) not in logged_ids]
+    markets = {}
+    for f in new_fills:
+        if f.ticker not in markets:
+            try:
+                markets[f.ticker] = client.get_market(f.ticker)
+            except Exception:
+                pass
+    logged = _log_fills(fills, "discretionary", None, markets)
     if logged:
         print(f"Synced {logged} new discretionary fill(s).")
     else:
@@ -127,6 +145,7 @@ def summary() -> None:
         "sell_contracts": 0.0, "sell_proceeds": 0.0,
     })
     strategies = defaultdict(set)
+    categories = defaultdict(lambda: defaultdict(float))  # type -> category -> net_cost
 
     with open(LOG_FILE, newline="") as f:
         for row in csv.DictReader(f):
@@ -140,9 +159,11 @@ def summary() -> None:
             if row["action"] == "buy":
                 s["buy_contracts"] += contracts
                 s["buy_cost"] += cost
+                categories[t][row.get("category") or "Unknown"] += cost
             else:
                 s["sell_contracts"] += contracts
                 s["sell_proceeds"] += cost
+                categories[t][row.get("category") or "Unknown"] -= cost
             if row.get("strategy"):
                 strategies[t].add(row["strategy"])
 
@@ -155,7 +176,6 @@ def summary() -> None:
             continue
         s = stats[trade_type]
         net = s["buy_cost"] - s["sell_proceeds"]
-        realized = s["sell_proceeds"] - s["buy_cost"] if s["sell_contracts"] > 0 else 0.0
         print(f"\n  [{trade_type.upper()}]")
         print(f"  Fills:             {s['fills']}")
         print(f"  Unique tickers:    {len(s['tickers'])}")
@@ -164,5 +184,9 @@ def summary() -> None:
         print(f"  Net deployed:      ${net:.2f}")
         if strategies[trade_type]:
             print(f"  Strategies:        {', '.join(sorted(strategies[trade_type]))}")
+        if categories[trade_type]:
+            print(f"  By category:")
+            for cat, amt in sorted(categories[trade_type].items(), key=lambda x: -x[1]):
+                print(f"    {cat:<25} ${amt:.2f}")
 
     print()
