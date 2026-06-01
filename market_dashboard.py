@@ -12,6 +12,7 @@ import csv
 from collections import defaultdict
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -337,6 +338,81 @@ def build_trade_pnl(client) -> tuple[pd.DataFrame, pd.DataFrame]:
     return settled_df, open_df
 
 
+def build_trade_analysis(settled_df: pd.DataFrame) -> dict:
+    """Compute accuracy / EV analysis tables from the settled P&L DataFrame."""
+    if settled_df.empty:
+        return {}
+
+    df = settled_df.copy()
+    df["Direction"] = np.where(df["Net YES"] > 0, "YES",
+                      np.where(df["Net YES"] < 0, "NO", "Closed"))
+    df["Won"] = (
+        ((df["Direction"] == "YES") & (df["Result"] == "YES")) |
+        ((df["Direction"] == "NO")  & (df["Result"] == "NO"))  |
+        ((df["Direction"] == "Closed") & (df["P&L"] > 0))
+    )
+    df["Edge"] = df["Won"].astype(float) - df["Avg Price"]
+
+    held   = df[df["Direction"] != "Closed"]
+    closed = df[df["Direction"] == "Closed"]
+
+    def _summary_row(label, sub):
+        n    = len(sub)
+        wins = int(sub["Won"].sum()) if n else 0
+        return {
+            "Group":      label,
+            "Positions":  n,
+            "Wins":       wins,
+            "Win%":       round(wins / n * 100, 1) if n else 0.0,
+            "Avg Entry%": round(sub["Avg Price"].mean() * 100, 1) if n else 0.0,
+            "Avg Edge%":  round(sub["Edge"].mean() * 100, 2) if n else 0.0,
+            "Total P&L":  round(sub["P&L"].sum(), 2) if n else 0.0,
+        }
+
+    summary_df = pd.DataFrame([
+        _summary_row("Held to expiry", held),
+        _summary_row("Early exits",    closed),
+        _summary_row("TOTAL",          df),
+    ])
+
+    # By price bucket — held positions only
+    bins   = [0, 0.50, 0.65, 0.75, 0.85, 0.92, 1.01]
+    labels = ["<50%", "50-65%", "65-75%", "75-85%", "85-92%", ">92%"]
+    held_copy = held.copy()
+    held_copy["Bucket"] = pd.cut(held_copy["Avg Price"], bins=bins, labels=labels, right=False)
+    bk = held_copy.groupby("Bucket", observed=True).agg(
+        Bets=("Won", "count"),
+        Wins=("Won", "sum"),
+        Win_pct=("Won", "mean"),
+        Avg_entry=("Avg Price", "mean"),
+        PnL=("P&L", "sum"),
+    ).reset_index()
+    bk["Win_pct"]   = (bk["Win_pct"] * 100).round(1)
+    bk["Avg_entry"] = (bk["Avg_entry"] * 100).round(1)
+    bk["Edge%"]     = (bk["Win_pct"] - bk["Avg_entry"]).round(1)
+    bk["PnL"]       = bk["PnL"].round(2)
+    bk.columns      = ["Price Bucket", "Bets", "Wins", "Win%", "Avg Entry%", "P&L", "Edge%"]
+    bucket_df = bk
+
+    # By category — all settled
+    cat = df.groupby("Category").agg(
+        Bets=("Won", "count"),
+        Wins=("Won", "sum"),
+        Win_pct=("Won", "mean"),
+        Avg_entry=("Avg Price", "mean"),
+        Avg_edge=("Edge", "mean"),
+        PnL=("P&L", "sum"),
+    ).reset_index().sort_values("PnL")
+    cat["Win_pct"]   = (cat["Win_pct"] * 100).round(1)
+    cat["Avg_entry"] = (cat["Avg_entry"] * 100).round(1)
+    cat["Avg_edge"]  = (cat["Avg_edge"] * 100).round(2)
+    cat["PnL"]       = cat["PnL"].round(2)
+    cat.columns      = ["Category", "Bets", "Wins", "Win%", "Avg Entry%", "Avg Edge%", "P&L"]
+    category_df = cat.reset_index(drop=True)
+
+    return {"summary": summary_df, "by_bucket": bucket_df, "by_category": category_df}
+
+
 # ---------------------------------------------------------------------------
 # Excel export
 # ---------------------------------------------------------------------------
@@ -451,7 +527,132 @@ def _style_pnl_sheet(ws, header_color: str):
     ws.freeze_panes = "A2"
 
 
-def export_excel(cat_df, time_df, active_df, settled_df=None, open_df=None):
+def _write_analysis_sheet(wb, analysis: dict):
+    if not analysis:
+        return
+
+    from openpyxl.chart import LineChart, Reference as Ref
+
+    ws = wb.create_sheet("Trade Analysis")
+    thin = Side(style="thin", color="D0D0D0")
+    bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    SEC_COLOR   = "1F4E79"
+    HDR_COLOR   = "2E75B6"
+    TOTAL_COLOR = "D9E1F2"
+    green_fill  = PatternFill("solid", fgColor="C6EFCE")
+    red_fill    = PatternFill("solid", fgColor="FFC7CE")
+    alt_fill    = PatternFill("solid", fgColor="EBF3FB")
+    MONEY_COLS  = {"P&L", "Total P&L"}
+    EDGE_COLS   = {"Edge%", "Avg Edge%"}
+
+    def _write_table(df, start_row, pnl_highlight=True):
+        """Write header + data rows; return (first_data_row, last_data_row)."""
+        n_cols = len(df.columns)
+        # Header row
+        for j, col in enumerate(df.columns, 1):
+            c = ws.cell(start_row, j, col)
+            c.font      = Font(bold=True, color="FFFFFF", size=10)
+            c.fill      = PatternFill("solid", fgColor=HDR_COLOR)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            c.border    = bdr
+        ws.row_dimensions[start_row].height = 20
+        first_data = start_row + 1
+        cur = first_data
+        n_rows = len(df)
+        for i, (_, rdata) in enumerate(df.iterrows()):
+            is_total = str(rdata.iloc[0]) == "TOTAL"
+            for j, val in enumerate(rdata, 1):
+                col_name = df.columns[j - 1]
+                c = ws.cell(cur, j, val)
+                c.border    = bdr
+                c.alignment = Alignment(
+                    horizontal="right" if isinstance(val, (int, float)) else "left"
+                )
+                if is_total:
+                    c.font = Font(bold=True)
+                    c.fill = PatternFill("solid", fgColor=TOTAL_COLOR)
+                elif pnl_highlight and col_name in MONEY_COLS and isinstance(val, (int, float)):
+                    c.fill = green_fill if val >= 0 else red_fill
+                    c.font = Font(bold=True)
+                elif pnl_highlight and col_name in EDGE_COLS and isinstance(val, (int, float)):
+                    c.fill = green_fill if val > 0 else (red_fill if val < 0 else PatternFill())
+                elif i % 2 == 1:
+                    c.fill = alt_fill
+            cur += 1
+        return first_data, cur - 1
+
+    def _section_header(title, row, n_cols):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=n_cols)
+        c = ws.cell(row, 1, title)
+        c.font      = Font(bold=True, color="FFFFFF", size=11)
+        c.fill      = PatternFill("solid", fgColor=SEC_COLOR)
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 22
+
+    row = 1
+    summary = analysis["summary"]
+    bucket  = analysis["by_bucket"]
+    categ   = analysis["by_category"]
+
+    # Section 1: Held vs Early Exit
+    _section_header("Held to Expiry vs Early Exits", row, len(summary.columns))
+    row += 1
+    _, _ = _write_table(summary, row)
+    row += len(summary) + 3
+
+    # Section 2: By Price Bucket
+    bucket_sec_row = row
+    _section_header("Win Rate vs Implied Probability — Held to Expiry", row, len(bucket.columns))
+    row += 1
+    bk_hdr_row = row
+    bk_first, bk_last = _write_table(bucket, row)
+    row = bk_last + 3
+
+    # Section 3: By Category
+    _section_header("Performance by Category", row, len(categ.columns))
+    row += 1
+    _write_table(categ, row)
+
+    # Auto-size columns
+    for col in ws.columns:
+        col_cells = [c for c in col if c.value is not None]
+        if not col_cells:
+            continue
+        max_len = max(len(str(c.value)) for c in col_cells)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 3, 28)
+
+    ws.freeze_panes = "A2"
+
+    # Calibration chart: Win% (col 4) vs Avg Entry% (col 5) by price bucket
+    if not bucket.empty:
+        n = len(bucket)
+        chart = LineChart()
+        chart.title  = "Calibration: Actual Win% vs Implied Probability"
+        chart.style  = 10
+        chart.y_axis.title = "Percent"
+        chart.x_axis.title = "Entry Price Bucket"
+        chart.width  = 24
+        chart.height = 14
+
+        cats       = Ref(ws, min_col=1, min_row=bk_first, max_row=bk_last)
+        win_data   = Ref(ws, min_col=4, min_row=bk_hdr_row, max_row=bk_last)  # Win% with header
+        entry_data = Ref(ws, min_col=5, min_row=bk_hdr_row, max_row=bk_last)  # Avg Entry% with header
+
+        chart.add_data(win_data,   titles_from_data=True)
+        chart.add_data(entry_data, titles_from_data=True)
+        chart.set_categories(cats)
+
+        chart.series[0].graphicalProperties.line.solidFill = "00B050"  # green = actual win%
+        chart.series[0].graphicalProperties.line.width = 25000
+        chart.series[1].graphicalProperties.line.solidFill = "4472C4"  # blue = implied
+        chart.series[1].graphicalProperties.line.width = 20000
+
+        anchor_col = len(bucket.columns) + 2
+        ws.add_chart(chart, f"{get_column_letter(anchor_col)}{bucket_sec_row}")
+
+
+def export_excel(cat_df, time_df, active_df, settled_df=None, open_df=None, analysis=None):
     sheets = {"By Category": cat_df, "Over Time": time_df, "Active Now": active_df}
     if settled_df is not None and not settled_df.empty:
         sheets["Settled P&L"] = settled_df
@@ -491,6 +692,9 @@ def export_excel(cat_df, time_df, active_df, settled_df=None, open_df=None):
     if "Open Positions" in wb.sheetnames:
         _style_pnl_sheet(wb["Open Positions"], COLORS["header_teal"])
 
+    if analysis:
+        _write_analysis_sheet(wb, analysis)
+
     wb.save(EXCEL_OUT)
     print(f"\nDashboard saved: {EXCEL_OUT}")
 
@@ -513,6 +717,7 @@ def main():
     cat_df    = category_totals(settled_rows) if settled_rows else pd.DataFrame()
     time_df   = volume_over_time(settled_rows) if settled_rows else pd.DataFrame()
     active_df = active_now(open_rows) if open_rows else pd.DataFrame()
+    analysis  = build_trade_analysis(settled_pnl)
 
     print("\n--- By Category (settled) ---")
     print(cat_df.to_string(index=False))
@@ -524,11 +729,16 @@ def main():
         wins = (settled_pnl["P&L"] > 0).sum()
         print(f"\n--- Trade P&L ({len(settled_pnl)} settled, {wins}W/{len(settled_pnl)-wins}L, total {total_pnl:+.2f}) ---")
         print(settled_pnl[["Ticker","Result","Net YES","P&L"]].to_string(index=False))
+    if analysis:
+        print("\n--- Trade Analysis ---")
+        print(analysis["summary"].to_string(index=False))
+        print()
+        print(analysis["by_bucket"].to_string(index=False))
     if not open_positions.empty:
         print(f"\n--- Open Positions ({len(open_positions)}) ---")
         print(open_positions[["Ticker","Net YES","Cost Basis"]].to_string(index=False))
 
-    export_excel(cat_df, time_df, active_df, settled_pnl, open_positions)
+    export_excel(cat_df, time_df, active_df, settled_pnl, open_positions, analysis)
 
 
 if __name__ == "__main__":
