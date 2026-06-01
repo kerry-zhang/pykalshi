@@ -51,8 +51,8 @@ class HistoricalCandlestick(BaseModel):
 class MveSelectedLeg(BaseModel):
     """A single leg in a multivariate event combo."""
     event_ticker: str
-    market_ticker: str
-    side: str  # "yes" or "no"
+    market_ticker: str | None = None
+    side: str | None = None  # "yes" or "no"
     yes_settlement_value_dollars: str | None = None
 
 
