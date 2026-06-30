@@ -33,6 +33,7 @@ data/
 # Trade log
 trades.csv
 sync_trades.log
+market_status_cache.json
 
 # Strategy research (private)
 strategy/

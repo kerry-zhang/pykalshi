@@ -24,10 +24,12 @@ from urllib.parse import urlencode
 from pykalshi import KalshiClient, MarketStatus
 from pykalshi.models import MarketModel as _MarketModel
 
-TRADES_CSV = os.path.join(os.path.dirname(__file__), "trades.csv")
+TRADES_CSV   = os.path.join(os.path.dirname(__file__), "trades.csv")
+MARKET_CACHE = os.path.join(os.path.dirname(__file__), "market_status_cache.json")
 
 EXCEL_OUT = os.path.join(os.path.dirname(__file__), "market_dashboard.xlsx")
 SETTLED_PAGES = 10        # pages of 200 = up to 2,000 settled markets
+OPEN_PAGES    = 20        # pages of 200 = up to 4,000 open/closed markets for 24h snapshot
 MIN_VOLUME    = 1.0       # drop truly zero-volume markets
 
 
@@ -168,36 +170,47 @@ def pull_settled(client, series_map: dict, pages: int = SETTLED_PAGES) -> list[d
     return rows
 
 
-def pull_open_24h(client, series_map: dict) -> list[dict]:
+def pull_open_24h(client, series_map: dict, pages: int = OPEN_PAGES) -> list[dict]:
     """Pull open and recently closed markets, return 24h volume by category."""
     rows = []
-    for status, label in [(MarketStatus.OPEN, "open"), (MarketStatus.CLOSED, "closed")]:
-        print(f"Fetching {label} markets for 24h volume snapshot...")
-        try:
-            markets = client.get_markets(status=status, limit=200, fetch_all=True)
-        except Exception as e:
-            print(f"  Warning: could not fetch {label} markets: {e}")
-            continue
+    for status, label in [("open", "open"), ("closed", "closed")]:
+        print(f"Fetching {label} markets for 24h volume snapshot (up to {pages} pages)...")
+        cursor = None
         count = 0
-        for m in markets:
+        for page in range(pages):
+            params: dict = {"status": status, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            qs = urlencode({k: v for k, v in params.items() if v is not None})
             try:
-                if m.ticker.startswith("KXMVE"):
+                response = client.get(f"/markets?{qs}")
+            except Exception as e:
+                print(f"  Warning: could not fetch {label} markets: {e}")
+                break
+            markets_data = response.get("markets") or []
+            cursor = response.get("cursor") or ""
+            for m_data in markets_data:
+                try:
+                    m = _MarketModel.model_validate(m_data)
+                    if m.ticker.startswith("KXMVE"):
+                        continue
+                    vol_24h = float(m.volume_24h_fp or 0)
+                    if vol_24h < MIN_VOLUME:
+                        continue
+                    series = m.series_ticker or infer_series(m.ticker)
+                    category = series_map[series]
+                    rows.append({
+                        "ticker":     m.ticker,
+                        "series":     series,
+                        "category":   category,
+                        "volume_24h": vol_24h,
+                        "total_vol":  float(m.volume_fp or 0),
+                    })
+                    count += 1
+                except Exception:
                     continue
-                vol_24h = float(m.volume_24h_fp or 0)
-                if vol_24h < MIN_VOLUME:
-                    continue
-                series = m.series_ticker or infer_series(m.ticker)
-                category = series_map[series]  # triggers heuristic fallback via __missing__
-                rows.append({
-                    "ticker":     m.ticker,
-                    "series":     series,
-                    "category":   category,
-                    "volume_24h": vol_24h,
-                    "total_vol":  float(m.volume_fp or 0),
-                })
-                count += 1
-            except Exception:
-                continue
+            if not cursor or len(markets_data) < 200:
+                break
         print(f"  {count} {label} markets with 24h volume > 0 (excl. MVE)")
     return rows
 
@@ -273,6 +286,20 @@ def _infer_category(ticker: str) -> str:
     return _guess_category(infer_series(ticker))
 
 
+def _load_market_cache() -> dict:
+    if os.path.exists(MARKET_CACHE):
+        import json
+        with open(MARKET_CACHE) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_market_cache(cache: dict):
+    import json
+    with open(MARKET_CACHE, "w") as f:
+        json.dump(cache, f)
+
+
 def build_trade_pnl(client) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (settled_df, open_df) from trades.csv with P&L computed."""
     if not os.path.exists(TRADES_CSV):
@@ -287,18 +314,29 @@ def build_trade_pnl(client) -> tuple[pd.DataFrame, pd.DataFrame]:
     for r in fills:
         by_ticker[r["ticker"]].append(r)
 
-    # Fetch market status for all unique tickers
-    print(f"Fetching market status for {len(by_ticker)} tickers...")
+    # Fetch market status — skip finalized tickers already in cache
+    cache = _load_market_cache()
     results = {}
     statuses = {}
-    for ticker in by_ticker:
+    uncached = [t for t in by_ticker if "FINALIZED" not in cache.get(t, {}).get("status", "")]
+    cached   = [t for t in by_ticker if t not in uncached]
+    for t in cached:
+        statuses[t] = cache[t]["status"]
+        results[t]  = cache[t]["result"]
+    print(f"Fetching market status for {len(uncached)} tickers ({len(cached)} cached)...")
+    for i, ticker in enumerate(uncached, 1):
         try:
             m = client.get_market(ticker)
             statuses[ticker] = str(m.status)
-            results[ticker] = (getattr(m, "result", None) or "").lower()
+            results[ticker]  = (getattr(m, "result", None) or "").lower()
+            if "FINALIZED" in str(m.status).upper():
+                cache[ticker] = {"status": str(m.status), "result": results[ticker]}
         except Exception:
             statuses[ticker] = "unknown"
-            results[ticker] = ""
+            results[ticker]  = ""
+        if i % 50 == 0:
+            print(f"  {i}/{len(uncached)} fetched...")
+    _save_market_cache(cache)
 
     def compute_position(ticker_fills):
         net_yes = 0.0
