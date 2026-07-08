@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 from .orders import AsyncOrder
 from ..enums import Action, Side, OrderStatus, TimeInForce, SelfTradePrevention, PositionCountFilter
+from ..exceptions import ResourceNotFoundError
 from ..dataframe import DataFrameList
 from .._utils import normalize_ticker, normalize_tickers
 from ..models import (
@@ -90,9 +92,11 @@ class AsyncPortfolio:
             price_level_structure=pls,
             fractional_trading_enabled=fte,
         )
-        response = await self._client.post("/portfolio/orders", order_data)
-        model = OrderModel.model_validate(response["order"])
-        return AsyncOrder(self._client, model)
+        # V2 create-order response is sparse (order_id, fill_count, remaining_count,
+        # ts_ms — no nested "order" object), unlike the deprecated v1 response. Fetch
+        # the full order afterward so callers keep getting a complete Order/OrderModel.
+        response = await self._client.post("/portfolio/events/orders", order_data)
+        return await self._get_order_with_retry(response["order_id"])
 
     async def cancel_order(self, order_id: str, *, subaccount: int | None = None) -> AsyncOrder:
         """Cancel a resting order.
@@ -104,12 +108,16 @@ class AsyncPortfolio:
         Returns:
             The canceled Order with updated status.
         """
-        endpoint = f"/portfolio/orders/{order_id}"
+        endpoint = f"/portfolio/events/orders/{order_id}"
         if subaccount is not None:
             endpoint += f"?subaccount={subaccount}"
-        response = await self._client.delete(endpoint)
-        model = OrderModel.model_validate(response["order"])
-        return AsyncOrder(self._client, model)
+        # V2 cancel response is sparse (order_id, reduced_by, ts_ms), same reasoning
+        # as place_order above — fetch the full order for a consistent return type.
+        await self._client.delete(endpoint)
+        # A cancel's terminal status can never legitimately still read RESTING —
+        # treat that as a stale pre-cancel snapshot and keep retrying (see
+        # _get_order_with_retry docstring for the confirmed-live race).
+        return await self._get_order_with_retry(order_id, stale_if=lambda o: o.status == OrderStatus.RESTING)
 
     async def amend_order(
         self,
@@ -228,6 +236,31 @@ class AsyncPortfolio:
         response = await self._client.get(f"/portfolio/orders/{order_id}")
         model = OrderModel.model_validate(response["order"])
         return AsyncOrder(self._client, model)
+
+    async def _get_order_with_retry(self, order_id: str, attempts: int = 5, delay: float = 0.3, stale_if=None) -> AsyncOrder:
+        """GET immediately after a V2 create/cancel can briefly 404, or (confirmed
+        live) return a stale pre-mutation snapshot with no error at all — e.g. a
+        cancel_order() read landing before the read replica catches up shows
+        status=RESTING even though the cancel already succeeded on the matching
+        engine. Retries on 404 always; `stale_if(order)` lets a caller flag a
+        successfully-fetched-but-known-stale result to keep retrying too.
+        """
+        last_order = None
+        last_exc = None
+        for i in range(attempts):
+            try:
+                order = await self.get_order(order_id)
+                if stale_if is None or not stale_if(order):
+                    return order
+                last_order = order
+                last_exc = None
+            except ResourceNotFoundError as e:
+                last_exc = e
+            if i < attempts - 1:
+                await asyncio.sleep(delay * (i + 1))
+        if last_exc is not None:
+            raise last_exc
+        return last_order
 
     async def get_positions(
         self,
@@ -575,7 +608,15 @@ class AsyncPortfolio:
         price_level_structure=None,
         fractional_trading_enabled=None,
     ) -> dict:
-        """Build and validate order data dict. No I/O.
+        """Build and validate a V2 (/portfolio/events/orders) order data dict. No I/O.
+
+        Kalshi's legacy (action=buy/sell, side=yes/no, yes_price/no_price) model
+        collapses in V2 to a single book `side` (bid/ask) always priced on the YES
+        leg. Official migration table (docs.kalshi.com/getting_started/order_direction):
+            (buy, yes) -> bid   (sell, no) -> bid   (buy, no) -> ask   (sell, yes) -> ask
+        `time_in_force` and `self_trade_prevention_type` are required in V2 (were
+        optional in v1); default to GTC / cancel-the-incoming-order-on-cross, which
+        matches how every caller in this codebase already places orders.
 
         If price_level_structure is provided, validates tick size alignment.
         If fractional_trading_enabled is provided (False), validates count_fp is whole.
@@ -599,27 +640,29 @@ class AsyncPortfolio:
 
         ticker_str = ticker.upper() if isinstance(ticker, str) else ticker.ticker
 
+        action_val = action.value if isinstance(action, Action) else action
+        side_val   = side.value if isinstance(side, Side) else side
+        book_side  = "bid" if (action_val, side_val) in (("buy", "yes"), ("sell", "no")) else "ask"
+
+        tif = time_in_force.value if isinstance(time_in_force, TimeInForce) else time_in_force
+        stp = self_trade_prevention.value if isinstance(self_trade_prevention, SelfTradePrevention) else self_trade_prevention
+
         order_data: dict = {
             "ticker": ticker_str,
-            "action": action.value,
-            "side": side.value,
-            "count_fp": count_fp,
-            "yes_price_dollars": yes_price_dollars,
+            "side": book_side,
+            "count": count_fp,
+            "price": yes_price_dollars,
+            "time_in_force": tif or TimeInForce.GTC.value,
+            "self_trade_prevention_type": stp or SelfTradePrevention.CANCEL_INCOMING.value,
         }
         if client_order_id is not None:
             order_data["client_order_id"] = client_order_id
-        if time_in_force is not None:
-            order_data["time_in_force"] = time_in_force.value
         if post_only:
             order_data["post_only"] = True
         if reduce_only:
             order_data["reduce_only"] = True
         if expiration_ts is not None:
-            order_data["expiration_ts"] = expiration_ts
-        if buy_max_cost_dollars is not None:
-            order_data["buy_max_cost_dollars"] = buy_max_cost_dollars
-        if self_trade_prevention is not None:
-            order_data["self_trade_prevention_type"] = self_trade_prevention.value
+            order_data["expiration_time"] = expiration_ts
         if order_group_id is not None:
             order_data["order_group_id"] = order_group_id
         if subaccount is not None:
