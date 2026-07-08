@@ -13,7 +13,7 @@ LOG_FILE = os.path.join(os.path.dirname(__file__), "trades.csv")
 _COLUMNS = [
     "fill_id", "trade_id", "order_id", "ticker",
     "side", "action", "contracts", "yes_price",
-    "fee", "type", "strategy", "category", "bet", "logged_at",
+    "fee", "type", "strategy", "category", "bet", "logged_at", "ts",
 ]
 
 
@@ -24,6 +24,19 @@ def _load_logged_ids() -> set:
         return set()
     with open(LOG_FILE, newline="") as f:
         return {row["fill_id"] for row in csv.DictReader(f)}
+
+
+def _max_logged_ts() -> int | None:
+    """Latest fill timestamp already in the log, or None if empty/untracked."""
+    if not os.path.exists(LOG_FILE):
+        return None
+    max_ts = None
+    with open(LOG_FILE, newline="") as f:
+        for row in csv.DictReader(f):
+            ts = row.get("ts")
+            if ts:
+                max_ts = max(max_ts or 0, int(float(ts)))
+    return max_ts
 
 
 def _append_rows(rows: list) -> None:
@@ -56,6 +69,7 @@ def _fill_to_row(fill, trade_type: str, strategy: str | None, market=None) -> di
         "category": category,
         "bet": bet,
         "logged_at": datetime.now(timezone.utc).isoformat(),
+        "ts": fill.ts,
     }
 
 
@@ -106,13 +120,23 @@ def place_systematic_order(
     return order
 
 
-def sync_discretionary(client: KalshiClient, limit: int = 200) -> int:
-    """Fetch recent fills and log any not already tracked as discretionary.
+_SYNC_LOOKBACK_SEC = 86400  # re-check the last day of fills as a safety margin against sync gaps
+
+
+def sync_discretionary(client: KalshiClient) -> int:
+    """Fetch fills since the last logged one (with a lookback safety margin)
+    and log any not already tracked as discretionary.
+
+    Paginates through *all* matching fills (not just the most recent page),
+    so a missed scheduled run can't cause fills to permanently fall outside
+    the fetch window and go untracked.
 
     Call this periodically to capture trades placed via the Kalshi app.
     Returns the number of new discretionary fills logged.
     """
-    fills = client.portfolio.get_fills(limit=limit)
+    last_ts = _max_logged_ts()
+    min_ts = max(last_ts - _SYNC_LOOKBACK_SEC, 0) if last_ts else None
+    fills = client.portfolio.get_fills(min_ts=min_ts, fetch_all=True)
     # Fetch market metadata for any tickers not yet logged
     logged_ids = _load_logged_ids()
     new_fills = [f for f in fills if (f.fill_id or f.trade_id) not in logged_ids]
