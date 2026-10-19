@@ -12,6 +12,7 @@ import csv
 from collections import defaultdict
 from datetime import datetime, timezone
 
+import httpx
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
@@ -300,6 +301,26 @@ def _save_market_cache(cache: dict):
         json.dump(cache, f)
 
 
+ELECTIONS_EVENTS_API = "https://api.elections.kalshi.com/v1/events/"
+
+
+def _lookup_elections_api(ticker: str) -> tuple[str, str] | None:
+    """Fallback status/result lookup for tickers that have rolled off the
+    trading API's ~2-month retention window (get_market() 404s on these)."""
+    event_ticker = ticker.rsplit("-", 1)[0]
+    try:
+        r = httpx.get(ELECTIONS_EVENTS_API + event_ticker,
+                       params={"exclude_nested_markets": "false"}, timeout=10)
+        if r.status_code != 200:
+            return None
+        for m in r.json().get("event", {}).get("markets", []):
+            if m.get("ticker_name") == ticker:
+                return m.get("status", ""), (m.get("result") or "").lower()
+    except Exception:
+        pass
+    return None
+
+
 def build_trade_pnl(client) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (settled_df, open_df) from trades.csv with P&L computed."""
     if not os.path.exists(TRADES_CSV):
@@ -329,11 +350,15 @@ def build_trade_pnl(client) -> tuple[pd.DataFrame, pd.DataFrame]:
             m = client.get_market(ticker)
             statuses[ticker] = str(m.status)
             results[ticker]  = (getattr(m, "result", None) or "").lower()
-            if "FINALIZED" in str(m.status).upper():
-                cache[ticker] = {"status": str(m.status), "result": results[ticker]}
         except Exception:
-            statuses[ticker] = "unknown"
-            results[ticker]  = ""
+            fallback = _lookup_elections_api(ticker)
+            if fallback:
+                statuses[ticker], results[ticker] = fallback
+            else:
+                statuses[ticker] = "unknown"
+                results[ticker]  = ""
+        if "FINALIZED" in statuses[ticker].upper():
+            cache[ticker] = {"status": statuses[ticker], "result": results[ticker]}
         if i % 50 == 0:
             print(f"  {i}/{len(uncached)} fetched...")
     _save_market_cache(cache)
